@@ -44,6 +44,11 @@ pgschema understands the following `GRANT`/`REVOKE` features:
 - **REVOKE GRANT OPTION FOR**: Revoke only the grant option while keeping the privilege
 - **PUBLIC**: Special grantee representing all roles
 
+These features apply to application-owned objects. Extension-member privileges,
+including custom grants and revoked defaults, are excluded from dump and plan
+along with the extension-owned definitions. Manage them separately from desired
+schema SQL; see [Using PostgreSQL Extensions](/cli/plan-db#using-postgresql-extensions).
+
 ## Examples
 
 ### Grant table privileges

@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/pgplex/pgschema/internal/diff"
 	"github.com/pgplex/pgschema/ir"
 	"github.com/spf13/cobra"
 )
@@ -234,6 +236,32 @@ func TestNormalizeSchemaNames_StripsSameSchemaQualifiersFromViewDefinitions(t *t
 	expected := " SELECT id, path::ltree\n   FROM categories c\n  WHERE nlevel(path) = 8"
 	if view.Definition != expected {
 		t.Fatalf("expected normalized view definition %q, got %q", expected, view.Definition)
+	}
+}
+
+func TestNormalizeSchemaNames_PreservesInheritedPartitionDefault(t *testing.T) {
+	const tempSchema = "pgschema_tmp_partition595"
+	childDefault, parentDefault := "public.member_default()", "public.member_default()"
+	child := &ir.Table{
+		Schema: tempSchema, Name: "app_child", PartitionOf: "member_parent",
+		PartitionOfSchema: "public", PartitionBound: "FOR VALUES FROM (0) TO (10)",
+		Columns:                []*ir.Column{{Name: "value", DefaultValue: &childDefault}},
+		PartitionParentColumns: []*ir.Column{{Name: "value", DefaultValue: &parentDefault}},
+	}
+	desired := &ir.IR{Schemas: map[string]*ir.Schema{
+		tempSchema: {Name: tempSchema, Tables: map[string]*ir.Table{"app_child": child}},
+	}}
+	normalizeSchemaNames(desired, tempSchema, "public")
+	changes := diff.GenerateMigration(ir.NewIR(), desired, "public")
+	var statements []string
+	for _, change := range changes {
+		for _, statement := range change.Statements {
+			statements = append(statements, statement.SQL)
+		}
+	}
+	sql := strings.Join(statements, "\n")
+	if !strings.Contains(sql, "PARTITION OF member_parent") || strings.Contains(sql, "DEFAULT") {
+		t.Fatalf("expected inherited default without a child override, got %s", sql)
 	}
 }
 

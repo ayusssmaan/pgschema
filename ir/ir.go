@@ -75,6 +75,11 @@ type Table struct {
 	// schema definition, so it is excluded from serialization (and thereby
 	// from fingerprints and plan JSON).
 	AllConstraintNames map[string]bool `json:"-"`
+	// PartitionParentColumns holds comparison metadata when a partition's
+	// parent is outside the managed IR, e.g. an extension member. It preserves
+	// child DEFAULT/NOT NULL overrides without managing or fingerprinting the
+	// parent itself.
+	PartitionParentColumns []*Column `json:"-"`
 	// DataManaged is true when the table matches [data] in pgschema.toml and
 	// its rows are part of the desired state. Rows holds those rows, in
 	// DataColumns() order. Both are excluded from serialization, and therefore

@@ -65,6 +65,19 @@ pgschema apply \
 
 pgschema does not manage extensions, so `dump` never emits `CREATE EXTENSION` and you should not add it to your schema files. Instead, the plan database must already have the extensions your schema uses, in the same schema as on the target.
 
+Extension-owned objects are also unmanaged. `dump` omits their definitions and
+privileges, and `plan` leaves them alone. This includes privileges changed after
+installation, such as a custom grant on `spatial_ref_sys` or a revoked `PUBLIC`
+grant on an extension function. Manage those privileges separately; do not put
+extension-member `GRANT`/`REVOKE` statements in the desired schema. In an external
+plan database those statements can affect the preinstalled extension itself,
+outside the temporary schema, without representing a managed change.
+
+Application objects that use extension types or functions remain managed,
+including their privileges. Membership is determined from PostgreSQL's dependency
+catalog, not object names or the schema containing the extension. Unlike
+`pg_dump`, pgschema does not export changes from an extension's initial privileges.
+
 The default embedded plan database handles this for you: it installs every extension found on the target database before applying your schema. This covers all extensions bundled with PostgreSQL (`hstore`, `pg_trgm`, `citext`, `uuid-ossp`, `btree_gist`, ...). Third-party extensions such as `postgis` or `pgvector` are not bundled, so for those you need an external plan database.
 
 An external plan database is not mirrored automatically: install every extension your schema uses yourself, bundled ones included, in the same schema as on the target:

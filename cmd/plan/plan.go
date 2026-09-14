@@ -584,6 +584,13 @@ func normalizeSchemaNames(irData *ir.IR, fromSchema, toSchema string) {
 					*column.GeneratedExpr = stripQualifiers(replaceString(*column.GeneratedExpr))
 				}
 			}
+			// Unmanaged parent defaults must use the same schema context as
+			// child defaults, otherwise inherited expressions look like overrides.
+			for _, column := range table.PartitionParentColumns {
+				if column.DefaultValue != nil {
+					*column.DefaultValue = stripQualifiers(replaceString(*column.DefaultValue))
+				}
+			}
 
 			// Normalize schema names in indexes
 			for _, index := range table.Indexes {

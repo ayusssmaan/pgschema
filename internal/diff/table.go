@@ -937,9 +937,13 @@ func generateTableSQL(table *ir.Table, targetSchema string, qualifySchema bool, 
 
 		// Detect per-child column overrides (DEFAULT, NOT NULL) by comparing against the parent.
 		parentKey := parentSchema + "." + table.PartitionOf
+		parentColumns := table.PartitionParentColumns
 		if parentTable, ok := allTables[parentKey]; ok {
-			parentCols := make(map[string]*ir.Column, len(parentTable.Columns))
-			for _, col := range parentTable.Columns {
+			parentColumns = parentTable.Columns
+		}
+		if len(parentColumns) > 0 {
+			parentCols := make(map[string]*ir.Column, len(parentColumns))
+			for _, col := range parentColumns {
 				parentCols[col.Name] = col
 			}
 			for _, col := range table.Columns {

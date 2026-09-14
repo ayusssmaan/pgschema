@@ -1,3 +1,9 @@
+-- Extension members are identified by their full pg_depend catalog identity.
+-- Only deptype 'e' denotes membership; ordinary dependencies (including 'x',
+-- AUTO_EXTENSION) must stay managed. Definitions and member ACLs are excluded
+-- consistently for dump and both sides of planning. Schemas themselves remain
+-- inspectable because an extension schema can also contain application objects.
+
 -- GetSchemas retrieves all user-defined schemas
 -- name: GetSchemas :many
 SELECT 
@@ -37,6 +43,15 @@ WHERE
     AND t.table_schema NOT LIKE 'pg_temp_%'
     AND t.table_schema NOT LIKE 'pg_toast_temp_%'
     AND t.table_type IN ('BASE TABLE', 'VIEW')
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY t.table_schema, t.table_name;
 
 -- GetTablesForSchema retrieves all tables in a specific schema with metadata
@@ -54,6 +69,15 @@ LEFT JOIN pg_description d ON d.objoid = c.oid AND d.classoid = 'pg_class'::regc
 WHERE
     t.table_schema = $1
     AND t.table_type IN ('BASE TABLE', 'VIEW')
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY t.table_name;
 
 -- GetColumns retrieves all columns for all tables
@@ -129,6 +153,15 @@ WITH column_base AS (
         c.table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
         AND c.table_schema NOT LIKE 'pg_temp_%'
         AND c.table_schema NOT LIKE 'pg_toast_temp_%'
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+                AND dep.objid = cl.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
 )
 SELECT
     cb.table_schema,
@@ -250,6 +283,15 @@ WITH column_base AS (
     LEFT JOIN pg_constraint nn ON nn.conrelid = cl.oid AND nn.contype = 'n' AND NOT nn.convalidated AND a.attnum = ANY(nn.conkey)
     WHERE
         c.table_schema = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+                AND dep.objid = cl.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
 )
 SELECT
     cb.table_schema,
@@ -392,6 +434,15 @@ WHERE n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     -- only root constraints (conparentid = 0) and child-specific constraints
     -- are dumpable. PARTITION OF auto-creates the inherited copies.
     AND c.conparentid = 0
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = cl.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, cl.relname, c.contype, c.conname, a.attnum;
 
 -- GetIndexes retrieves all indexes including regular and unique indexes created with CREATE INDEX
@@ -430,6 +481,24 @@ WITH index_base AS (
         AND n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
         AND n.nspname NOT LIKE 'pg_temp_%'
         AND n.nspname NOT LIKE 'pg_toast_temp_%'
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+                AND dep.objid = t.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+                AND dep.objid = i.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
 )
 SELECT
     ib.schemaname,
@@ -528,6 +597,24 @@ WITH index_base AS (
             AND c.contype IN ('u', 'p', 'x')
         )
         AND n.nspname = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+                AND dep.objid = t.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+                AND dep.objid = i.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
 )
 SELECT
     ib.schemaname,
@@ -575,11 +662,39 @@ SELECT
     maximum_value,
     increment,
     cycle_option
-FROM information_schema.sequences
+FROM information_schema.sequences s
+JOIN pg_namespace n ON n.nspname = s.sequence_schema
+JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = s.sequence_name
 WHERE 
     sequence_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     AND sequence_schema NOT LIKE 'pg_temp_%'
     AND sequence_schema NOT LIKE 'pg_toast_temp_%'
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
+    -- SERIAL/identity sequences inherit the owning extension table's boundary.
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend owned
+        JOIN pg_catalog.pg_depend ext ON ext.objid = owned.refobjid
+            AND ext.classid = 'pg_catalog.pg_class'::regclass
+            AND ext.objsubid = 0
+            AND ext.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND ext.refobjsubid = 0
+            AND ext.deptype = 'e'
+        WHERE c.relkind = 'S'
+            AND owned.classid = 'pg_catalog.pg_class'::regclass
+            AND owned.objid = c.oid
+            AND owned.objsubid = 0
+            AND owned.refclassid = 'pg_catalog.pg_class'::regclass
+            AND owned.refobjsubid > 0
+            AND owned.deptype IN ('a', 'i')
+    )
 ORDER BY sequence_schema, sequence_name;
 
 -- GetFunctions retrieves all user-defined functions (excluding extension members)
@@ -606,14 +721,21 @@ FROM information_schema.routines r
 LEFT JOIN pg_proc p ON p.proname = r.routine_name
     AND p.pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = r.routine_schema)
     AND p.oid = (regexp_match(r.specific_name, '_(\d+)$'))[1]::oid
-LEFT JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
 LEFT JOIN pg_description desc_func ON desc_func.objoid = p.oid AND desc_func.classoid = 'pg_proc'::regclass
 WHERE
     r.routine_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     AND r.routine_schema NOT LIKE 'pg_temp_%'
     AND r.routine_schema NOT LIKE 'pg_toast_temp_%'
     AND r.routine_type = 'FUNCTION'
-    AND d.objid IS NULL  -- Exclude functions that are extension members
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_proc'::regclass
+            AND dep.objid = p.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY r.routine_schema, r.routine_name;
 
 -- GetProcedures retrieves all user-defined procedures (excluding extension members)
@@ -631,14 +753,21 @@ FROM information_schema.routines r
 LEFT JOIN pg_proc p ON p.proname = r.routine_name
     AND p.pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = r.routine_schema)
     AND p.oid = (regexp_match(r.specific_name, '_(\d+)$'))[1]::oid
-LEFT JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
 LEFT JOIN pg_description desc_proc ON desc_proc.objoid = p.oid AND desc_proc.classoid = 'pg_proc'::regclass
 WHERE
     r.routine_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     AND r.routine_schema NOT LIKE 'pg_temp_%'
     AND r.routine_schema NOT LIKE 'pg_toast_temp_%'
     AND r.routine_type = 'PROCEDURE'
-    AND d.objid IS NULL  -- Exclude procedures that are extension members
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_proc'::regclass
+            AND dep.objid = p.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY r.routine_schema, r.routine_name;
 
 -- GetAggregates retrieves all user-defined aggregates
@@ -687,9 +816,14 @@ WHERE p.prokind = 'a'  -- Only aggregates
     AND n.nspname NOT LIKE 'pg_temp_%'
     AND n.nspname NOT LIKE 'pg_toast_temp_%'
     AND NOT EXISTS (
-        SELECT 1 FROM pg_depend dep 
-        WHERE dep.objid = p.oid AND dep.deptype = 'e'
-    )  -- Exclude extension members
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_proc'::regclass
+            AND dep.objid = p.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, p.proname;
 
 -- GetViews retrieves all views and materialized views
@@ -708,6 +842,15 @@ WHERE
     AND n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     AND n.nspname NOT LIKE 'pg_temp_%'
     AND n.nspname NOT LIKE 'pg_toast_temp_%'
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, c.relname;
 
 
@@ -731,6 +874,15 @@ WHERE t.typtype IN ('e', 'c')  -- ENUM and composite types only
     AND n.nspname NOT LIKE 'pg_temp_%'
     AND n.nspname NOT LIKE 'pg_toast_temp_%'
     AND (t.typtype = 'e' OR (t.typtype = 'c' AND c.relkind = 'c'))  -- For composite types, only include true composite types (not table types)
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, t.typname;
 
 -- GetEnumValues retrieves enum values for ENUM types
@@ -746,6 +898,15 @@ JOIN pg_namespace n ON t.typnamespace = n.oid
 WHERE n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     AND n.nspname NOT LIKE 'pg_temp_%'
     AND n.nspname NOT LIKE 'pg_toast_temp_%'
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, t.typname, e.enumsortorder;
 
 -- GetCompositeTypeColumns retrieves columns for composite types
@@ -782,6 +943,15 @@ WHERE t.typtype = 'c'  -- composite types only
     AND n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     AND n.nspname NOT LIKE 'pg_temp_%'
     AND n.nspname NOT LIKE 'pg_toast_temp_%'
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, t.typname, a.attnum;
 
 -- GetTriggers retrieves all triggers
@@ -795,11 +965,32 @@ SELECT
     action_statement,
     action_condition,
     action_orientation
-FROM information_schema.triggers
+FROM information_schema.triggers it
+JOIN pg_namespace n ON n.nspname = it.trigger_schema
+JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = it.event_object_table
+JOIN pg_trigger t ON t.tgrelid = c.oid AND t.tgname = it.trigger_name
 WHERE 
     trigger_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     AND trigger_schema NOT LIKE 'pg_temp_%'
     AND trigger_schema NOT LIKE 'pg_toast_temp_%'
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_trigger'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY trigger_schema, event_object_table, trigger_name;
 
 -- GetViewDependencies retrieves view dependencies on tables and other views  
@@ -834,6 +1025,15 @@ WHERE
     AND n.nspname NOT LIKE 'pg_toast_temp_%'
     AND c.relkind IN ('r', 'p')  -- ordinary and partitioned tables (issue #471)
     AND c.relrowsecurity = true
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, c.relname;
 
 -- GetRLSPolicies retrieves all row level security policies
@@ -881,6 +1081,15 @@ WHERE
     n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     AND n.nspname NOT LIKE 'pg_temp_%'
     AND n.nspname NOT LIKE 'pg_toast_temp_%'
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, c.relname, pol.polname;
 
 -- GetRLSTablesForSchema retrieves tables with row level security enabled for a specific schema
@@ -896,6 +1105,15 @@ WHERE
     n.nspname = $1
     AND c.relkind IN ('r', 'p')  -- ordinary and partitioned tables (issue #471)
     AND c.relrowsecurity = true
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, c.relname;
 
 -- GetRLSPoliciesForSchema retrieves all row level security policies for a specific schema
@@ -941,6 +1159,15 @@ LEFT JOIN LATERAL (
 ) e ON true
 WHERE
     n.nspname = $1
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, c.relname, pol.polname;
 
 -- GetDomains retrieves all user-defined domains
@@ -974,6 +1201,15 @@ WHERE t.typtype = 'd'  -- Domain types only
     AND n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     AND n.nspname NOT LIKE 'pg_temp_%'
     AND n.nspname NOT LIKE 'pg_toast_temp_%'
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, t.typname;
 
 -- GetDomainConstraints retrieves constraints for domains
@@ -990,6 +1226,15 @@ WHERE t.typtype = 'd'  -- Domain types only
     AND n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     AND n.nspname NOT LIKE 'pg_temp_%'
     AND n.nspname NOT LIKE 'pg_toast_temp_%'
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, t.typname, c.conname;
 
 -- GetPartitionedTablesForSchema retrieves partition information for partitioned tables in a specific schema
@@ -1009,6 +1254,15 @@ JOIN pg_class c ON pt.partrelid = c.oid
 JOIN pg_namespace n ON c.relnamespace = n.oid
 JOIN pg_attribute a ON a.attrelid = pt.partrelid AND a.attnum = ANY(pt.partattrs)
 WHERE n.nspname = $1
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 GROUP BY n.nspname, c.relname, pt.partstrat
 ORDER BY n.nspname, c.relname;
 
@@ -1035,7 +1289,44 @@ WHERE pn.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
         SELECT 1 FROM pg_partitioned_table pt 
         WHERE pt.partrelid = pc.oid
     )
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = cc.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY pn.nspname, pc.relname, cn.nspname, cc.relname;
+
+-- Parent columns are comparison metadata for managed partitions whose parent
+-- is not in the managed IR (for example, an extension member). Do not apply
+-- extension-member filters here: these rows never become managed tables.
+-- name: GetPartitionParentColumnsForSchema :many
+SELECT
+    cc.relname AS child_table,
+    a.attname AS column_name,
+    NOT (a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS is_nullable,
+    ge.column_default
+FROM pg_catalog.pg_inherits inh
+JOIN pg_catalog.pg_class cc ON cc.oid = inh.inhrelid
+JOIN pg_catalog.pg_namespace cn ON cn.oid = cc.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = inh.inhparent
+JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+LEFT JOIN LATERAL (
+    SELECT
+        set_config('search_path', 'pg_catalog', true) AS dummy,
+        CASE WHEN a.attgenerated IN ('s', 'v') THEN NULL
+             ELSE pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+        END AS column_default
+) ge ON true
+WHERE cn.nspname = $1
+    AND cc.relispartition
+    AND a.attnum > 0
+    AND NOT a.attisdropped
+ORDER BY cc.relname, a.attnum;
 
 
 -- GetConstraintsForSchema retrieves all table constraints for a specific schema
@@ -1121,6 +1412,15 @@ WHERE n.nspname = $1
     -- only root constraints (conparentid = 0) and child-specific constraints
     -- are dumpable. PARTITION OF auto-creates the inherited copies.
     AND c.conparentid = 0
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = cl.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, cl.relname, c.contype, c.conname, a.attnum;
 
 -- GetSequencesForSchema retrieves all sequences for a specific schema
@@ -1148,6 +1448,32 @@ LEFT JOIN pg_depend d ON d.objid = c.oid AND d.classid = 'pg_class'::regclass AN
 LEFT JOIN pg_class dep_table ON d.refobjid = dep_table.oid
 LEFT JOIN pg_attribute dep_col ON dep_col.attrelid = dep_table.oid AND dep_col.attnum = d.refobjsubid
 WHERE s.schemaname = $1
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
+    -- SERIAL/identity sequences inherit the owning extension table's boundary.
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend owned
+        JOIN pg_catalog.pg_depend ext ON ext.objid = owned.refobjid
+            AND ext.classid = 'pg_catalog.pg_class'::regclass
+            AND ext.objsubid = 0
+            AND ext.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND ext.refobjsubid = 0
+            AND ext.deptype = 'e'
+        WHERE c.relkind = 'S'
+            AND owned.classid = 'pg_catalog.pg_class'::regclass
+            AND owned.objid = c.oid
+            AND owned.objsubid = 0
+            AND owned.refclassid = 'pg_catalog.pg_class'::regclass
+            AND owned.refobjsubid > 0
+            AND owned.deptype IN ('a', 'i')
+    )
 ORDER BY s.schemaname, s.sequencename;
 
 -- GetFunctionsForSchema retrieves all user-defined functions for a specific schema
@@ -1182,11 +1508,18 @@ FROM information_schema.routines r
 LEFT JOIN pg_proc p ON p.proname = r.routine_name
     AND p.pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = r.routine_schema)
     AND p.oid = (regexp_match(r.specific_name, '_(\d+)$'))[1]::oid
-LEFT JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
 LEFT JOIN pg_description desc_func ON desc_func.objoid = p.oid AND desc_func.classoid = 'pg_proc'::regclass
 WHERE r.routine_schema = $1
     AND r.routine_type = 'FUNCTION'
-    AND d.objid IS NULL  -- Exclude functions that are extension members
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_proc'::regclass
+            AND dep.objid = p.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY r.routine_schema, r.routine_name;
 
 -- GetProceduresForSchema retrieves all user-defined procedures for a specific schema
@@ -1209,11 +1542,18 @@ FROM information_schema.routines r
 LEFT JOIN pg_proc p ON p.proname = r.routine_name
     AND p.pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = r.routine_schema)
     AND p.oid = (regexp_match(r.specific_name, '_(\d+)$'))[1]::oid
-LEFT JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
 LEFT JOIN pg_description desc_proc ON desc_proc.objoid = p.oid AND desc_proc.classoid = 'pg_proc'::regclass
 WHERE r.routine_schema = $1
     AND r.routine_type = 'PROCEDURE'
-    AND d.objid IS NULL  -- Exclude procedures that are extension members
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_proc'::regclass
+            AND dep.objid = p.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY r.routine_schema, r.routine_name;
 
 -- GetAggregatesForSchema retrieves all user-defined aggregates for a specific schema.
@@ -1322,9 +1662,14 @@ LEFT JOIN pg_description d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regcl
 WHERE p.prokind = 'a'  -- Only aggregates
     AND n.nspname = $1
     AND NOT EXISTS (
-        SELECT 1 FROM pg_depend dep
-        WHERE dep.objid = p.oid AND dep.deptype = 'e'
-    )  -- Exclude extension members
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_proc'::regclass
+            AND dep.objid = p.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, p.proname;
 
 -- GetViewsForSchema retrieves all views and materialized views for a specific schema
@@ -1347,6 +1692,15 @@ WITH view_definitions AS (
     WHERE
         c.relkind IN ('v', 'm') -- views and materialized views
         AND n.nspname = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+                AND dep.objid = c.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
 )
 SELECT
     vd.table_schema,
@@ -1416,6 +1770,24 @@ WHERE n.nspname = $1
     -- defined on a partitioned parent; pg_dump emits only the top-level trigger
     -- on the parent (tgparentid = 0).
     AND t.tgparentid = 0
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+            AND dep.objid = c.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_trigger'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, c.relname, t.tgname;
 
 -- GetTypesForSchema retrieves all user-defined types for a specific schema
@@ -1436,6 +1808,15 @@ LEFT JOIN pg_class c ON t.typrelid = c.oid
 WHERE t.typtype IN ('e', 'c')  -- ENUM and composite types only
     AND n.nspname = $1
     AND (t.typtype = 'e' OR (t.typtype = 'c' AND c.relkind = 'c'))  -- For composite types, only include true composite types (not table types)
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, t.typname;
 
 -- GetDomainsForSchema retrieves all user-defined domains for a specific schema
@@ -1467,6 +1848,15 @@ LEFT JOIN pg_namespace ben ON bet.typnamespace = ben.oid
 LEFT JOIN pg_description d ON d.objoid = t.oid AND d.classoid = 'pg_type'::regclass
 WHERE t.typtype = 'd'  -- Domain types only
     AND n.nspname = $1
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, t.typname;
 
 -- GetDomainConstraintsForSchema retrieves constraints for domains in a specific schema
@@ -1481,6 +1871,15 @@ JOIN pg_type t ON c.contypid = t.oid
 JOIN pg_namespace n ON t.typnamespace = n.oid
 WHERE t.typtype = 'd'  -- Domain types only
     AND n.nspname = $1
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, t.typname, c.conname;
 
 -- GetEnumValuesForSchema retrieves enum values for ENUM types in a specific schema
@@ -1494,6 +1893,15 @@ FROM pg_enum e
 JOIN pg_type t ON e.enumtypid = t.oid
 JOIN pg_namespace n ON t.typnamespace = n.oid
 WHERE n.nspname = $1
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, t.typname, e.enumsortorder;
 
 -- GetCompositeTypeColumnsForSchema retrieves columns for composite types in a specific schema
@@ -1528,6 +1936,15 @@ WHERE t.typtype = 'c'  -- composite types only
     AND a.attnum > 0  -- exclude system columns
     AND NOT a.attisdropped  -- exclude dropped columns
     AND n.nspname = $1
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_depend dep
+        WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+            AND dep.objid = t.oid
+            AND dep.objsubid = 0
+            AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+            AND dep.refobjsubid = 0
+            AND dep.deptype = 'e'
+    )
 ORDER BY n.nspname, t.typname, a.attnum;
 
 -- GetDefaultPrivilegesForSchema retrieves default privileges for a specific schema
@@ -1583,8 +2000,34 @@ WITH acl_data AS (
     FROM pg_class c
     JOIN pg_namespace n ON c.relnamespace = n.oid
     WHERE n.nspname = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+                AND dep.objid = c.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
         AND c.relkind IN ('r', 'v', 'm', 'S')
         AND c.relacl IS NOT NULL
+        -- SERIAL/identity sequences inherit the owning extension table's boundary.
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend owned
+            JOIN pg_catalog.pg_depend ext ON ext.objid = owned.refobjid
+                AND ext.classid = 'pg_catalog.pg_class'::regclass
+                AND ext.objsubid = 0
+                AND ext.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND ext.refobjsubid = 0
+                AND ext.deptype = 'e'
+            WHERE c.relkind = 'S'
+                AND owned.classid = 'pg_catalog.pg_class'::regclass
+                AND owned.objid = c.oid
+                AND owned.objsubid = 0
+                AND owned.refclassid = 'pg_catalog.pg_class'::regclass
+                AND owned.refobjsubid > 0
+                AND owned.deptype IN ('a', 'i')
+        )
 
     UNION ALL
 
@@ -1598,6 +2041,15 @@ WITH acl_data AS (
     FROM pg_proc p
     JOIN pg_namespace n ON p.pronamespace = n.oid
     WHERE n.nspname = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_proc'::regclass
+                AND dep.objid = p.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
         AND p.prokind = 'f'
         AND p.proacl IS NOT NULL
 
@@ -1613,6 +2065,15 @@ WITH acl_data AS (
     FROM pg_proc p
     JOIN pg_namespace n ON p.pronamespace = n.oid
     WHERE n.nspname = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_proc'::regclass
+                AND dep.objid = p.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
         AND p.prokind = 'p'
         AND p.proacl IS NOT NULL
 
@@ -1628,7 +2089,25 @@ WITH acl_data AS (
     FROM pg_type t
     JOIN pg_namespace n ON t.typnamespace = n.oid
     WHERE n.nspname = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+                AND dep.objid = t.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
         AND t.typtype IN ('e', 'c', 'd')
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+                AND dep.objid = t.typrelid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
         AND t.typacl IS NOT NULL
 )
 SELECT
@@ -1653,6 +2132,15 @@ WITH objects_with_acl AS (
     FROM pg_proc p
     JOIN pg_namespace n ON p.pronamespace = n.oid
     WHERE n.nspname = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_proc'::regclass
+                AND dep.objid = p.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
         AND p.prokind = 'f'
 
     UNION ALL
@@ -1665,6 +2153,15 @@ WITH objects_with_acl AS (
     FROM pg_proc p
     JOIN pg_namespace n ON p.pronamespace = n.oid
     WHERE n.nspname = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_proc'::regclass
+                AND dep.objid = p.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
         AND p.prokind = 'p'
 
     UNION ALL
@@ -1677,7 +2174,25 @@ WITH objects_with_acl AS (
     FROM pg_type t
     JOIN pg_namespace n ON t.typnamespace = n.oid
     WHERE n.nspname = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_type'::regclass
+                AND dep.objid = t.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
         AND t.typtype IN ('e', 'c', 'd')
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+                AND dep.objid = t.typrelid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
 ),
 public_grants AS (
     SELECT
@@ -1708,6 +2223,15 @@ WITH column_acls AS (
     JOIN pg_class c ON a.attrelid = c.oid
     JOIN pg_namespace n ON c.relnamespace = n.oid
     WHERE n.nspname = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend dep
+            WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+                AND dep.objid = c.oid
+                AND dep.objsubid = 0
+                AND dep.refclassid = 'pg_catalog.pg_extension'::regclass
+                AND dep.refobjsubid = 0
+                AND dep.deptype = 'e'
+        )
         AND c.relkind IN ('r', 'v', 'm')  -- tables, views, materialized views
         AND a.attnum > 0                   -- skip system columns
         AND NOT a.attisdropped

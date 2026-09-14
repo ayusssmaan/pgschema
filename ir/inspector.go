@@ -140,6 +140,10 @@ func (i *Inspector) BuildIR(ctx context.Context, targetSchema string) (*IR, erro
 		return nil, err
 	}
 
+	if err := i.buildPartitionParentColumns(ctx, schema, targetSchema); err != nil {
+		return nil, fmt.Errorf("failed to build partition parent columns: %w", err)
+	}
+
 	// Load rows of data-managed tables now that columns, constraints, and
 	// partitions are known.
 	if err := i.buildRows(ctx, schema, targetSchema); err != nil {
@@ -758,6 +762,42 @@ func (i *Inspector) buildPartitionMapping(ctx context.Context, schema *IR, targe
 	}
 
 	return partitionMapping
+}
+
+// buildPartitionParentColumns keeps unmanaged parents available for comparing
+// inherited column properties, without adding their definitions to the IR.
+func (i *Inspector) buildPartitionParentColumns(ctx context.Context, schema *IR, targetSchema string) error {
+	children := make(map[string]*Table)
+	for name, table := range schema.Schemas[targetSchema].Tables {
+		if table.PartitionOf == "" {
+			continue
+		}
+		parentSchema := table.PartitionOfSchema
+		if parentSchema == "" {
+			parentSchema = targetSchema
+		}
+		if s := schema.Schemas[parentSchema]; s != nil && s.Tables[table.PartitionOf] != nil {
+			continue
+		}
+		children[name] = table
+	}
+	if len(children) == 0 {
+		return nil
+	}
+	columns, err := i.queries.GetPartitionParentColumnsForSchema(ctx, targetSchema)
+	if err != nil {
+		return err
+	}
+	for _, col := range columns {
+		if table := children[col.ChildTable]; table != nil {
+			column := &Column{Name: col.ColumnName, IsNullable: col.IsNullable.Bool}
+			if col.ColumnDefault.Valid {
+				column.DefaultValue = &col.ColumnDefault.String
+			}
+			table.PartitionParentColumns = append(table.PartitionParentColumns, column)
+		}
+	}
+	return nil
 }
 
 // sortPrimaryKeyColumnsForPartitionedTable sorts primary key constraint columns

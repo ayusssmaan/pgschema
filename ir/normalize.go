@@ -161,6 +161,11 @@ func normalizeTable(table *Table) {
 	for _, column := range table.Columns {
 		normalizeColumn(column, table.Schema)
 	}
+	// Compare parent expressions in the child's schema context, just like its
+	// own defaults. The parent can live in a different (unmanaged) schema.
+	for _, column := range table.PartitionParentColumns {
+		normalizeColumn(column, table.Schema)
+	}
 
 	// Normalize policies
 	for _, policy := range table.Policies {
@@ -1598,6 +1603,7 @@ func IsTextLikeType(typeName string) bool {
 // to avoid a perpetual spurious diff (issue #473):
 //   - array-level cast: "col::text = ANY ((ARRAY['a'::varchar])::text[])"   (wrapping paren + array cast)
 //   - element-level:    "col::text = ANY (ARRAY[('a'::varchar)::text])"      (cast on each element)
+//
 // Both collapse to "col::text IN ('a'::varchar)".
 func convertAnyArrayToIn(expr string) string {
 	const anyMarker = " = ANY ("
