@@ -40,6 +40,16 @@ type Inspector struct {
 	ignoreConfig *IgnoreConfig
 	dataConfig   *DataConfig
 	loadRows     bool
+	// extensionSchemas is the set of schema names hosting at least one
+	// installed extension on this connection, populated once per BuildIR call
+	// (see populateExtensionSchemas). Used alongside routineSchema in
+	// stripSameSchemaPrefix, and alongside targetSchema in buildPrivileges, so
+	// a function/procedure parameter or privilege object_name owned by an
+	// extension (e.g. pgvector's "vector") is recognized as same-schema even
+	// when the routine itself is currently being introspected from a
+	// different schema than the extension lives in - notably, pgschema's own
+	// temporary comparison schema during plan generation (issue #518).
+	extensionSchemas map[string]bool
 }
 
 // NewInspector creates a new schema inspector with optional ignore configuration
@@ -76,6 +86,10 @@ func (i *Inspector) BuildIR(ctx context.Context, targetSchema string) (*IR, erro
 
 	if err := i.buildSchemas(ctx, schema, targetSchema); err != nil {
 		return nil, fmt.Errorf("failed to build schemas: %w", err)
+	}
+
+	if err := i.populateExtensionSchemas(ctx); err != nil {
+		return nil, fmt.Errorf("failed to query extension schemas: %w", err)
 	}
 
 	if err := i.buildTables(ctx, schema, targetSchema); err != nil {
@@ -1355,30 +1369,85 @@ func (i *Inspector) parseParametersFromSignature(signature string, routineSchema
 // This ensures consistent comparison between database inspection (which may return qualified
 // names) and source SQL (which typically uses unqualified names for same-schema types).
 func (i *Inspector) stripSameSchemaPrefix(typeName, routineSchema string) string {
-	if typeName == "" || routineSchema == "" {
+	if typeName == "" {
 		return typeName
 	}
 
+	if routineSchema != "" {
+		if stripped, ok := stripSchemaPrefixIfMatches(typeName, routineSchema); ok {
+			return stripped
+		}
+	}
+
+	// Also strip a prefix matching any schema known to host an installed
+	// extension (see populateExtensionSchemas). An extension-owned type's
+	// schema is a property of the extension, not of the function using it -
+	// pgschema's temporary comparison schema during plan generation
+	// introspects functions as if their routineSchema were that temp schema,
+	// which would otherwise leave a genuinely same-extension type qualified
+	// while the live database renders it bare (issue #518).
+	for extSchema := range i.extensionSchemas {
+		if stripped, ok := stripSchemaPrefixIfMatches(typeName, extSchema); ok {
+			return stripped
+		}
+	}
+
+	// No matching prefix - return as-is (could be cross-schema type or already unqualified)
+	return typeName
+}
+
+// stripSchemaPrefixIfMatches strips a "schema." or "\"schema\"." prefix from
+// typeName if it matches schemaName, reporting whether a strip happened.
+func stripSchemaPrefixIfMatches(typeName, schemaName string) (string, bool) {
 	// Remove quotes from schema name for comparison
-	unquotedSchema := routineSchema
-	if strings.HasPrefix(routineSchema, `"`) && strings.HasSuffix(routineSchema, `"`) {
-		unquotedSchema = routineSchema[1 : len(routineSchema)-1]
+	unquotedSchema := schemaName
+	if strings.HasPrefix(schemaName, `"`) && strings.HasSuffix(schemaName, `"`) {
+		unquotedSchema = schemaName[1 : len(schemaName)-1]
 	}
 
 	// Handle quoted schema prefix: "schema".typename
 	quotedPrefix := fmt.Sprintf(`"%s".`, unquotedSchema)
 	if strings.HasPrefix(typeName, quotedPrefix) {
-		return typeName[len(quotedPrefix):]
+		return typeName[len(quotedPrefix):], true
 	}
 
 	// Handle unquoted schema prefix: schema.typename
 	unquotedPrefix := unquotedSchema + "."
 	if strings.HasPrefix(typeName, unquotedPrefix) {
-		return typeName[len(unquotedPrefix):]
+		return typeName[len(unquotedPrefix):], true
 	}
 
-	// No matching prefix - return as-is (could be cross-schema type or already unqualified)
-	return typeName
+	return typeName, false
+}
+
+// populateExtensionSchemas records which schemas host at least one installed
+// extension on this connection, for use by stripSameSchemaPrefix and
+// buildPrivileges. Extensions are database-wide, so this runs once per
+// BuildIR call rather than per schema/target.
+func (i *Inspector) populateExtensionSchemas(ctx context.Context) error {
+	rows, err := i.db.QueryContext(ctx,
+		`SELECT DISTINCT n.nspname
+		 FROM pg_catalog.pg_extension e
+		 JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	extensionSchemas := make(map[string]bool)
+	for rows.Next() {
+		var schemaName string
+		if err := rows.Scan(&schemaName); err != nil {
+			return err
+		}
+		extensionSchemas[schemaName] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	i.extensionSchemas = extensionSchemas
+	return nil
 }
 
 // stripSameSchemaPrefixFromList is stripSameSchemaPrefix for a comma-separated
@@ -2294,6 +2363,21 @@ func (i *Inspector) buildPrivileges(ctx context.Context, schema *IR, targetSchem
 		objectName := row.ObjectName.String
 		objectType := row.ObjectType.String
 		privilegeType := row.PrivilegeType.String
+
+		// FUNCTION/PROCEDURE object_name is rendered by pg_get_function_identity_arguments
+		// directly in SQL (see GetPrivilegesForSchema), so it never goes through
+		// stripSameSchemaPrefix the way parseParametersFromSignature does. Strip it
+		// here too (routine's own schema, then any extension schema), so a privilege
+		// on the same function keys identically regardless of which schema it's
+		// currently being introspected from (issue #518 - see stripSameSchemaPrefix
+		// for the temp-schema/extension-schema rationale). Reuses the same
+		// StripSchemaQualifiers tokenizer already used for aggregate signatures.
+		if objectType == "FUNCTION" || objectType == "PROCEDURE" {
+			objectName = StripSchemaQualifiers(objectName, targetSchema)
+			for extSchema := range i.extensionSchemas {
+				objectName = StripSchemaQualifiers(objectName, extSchema)
+			}
+		}
 		owner := row.Owner.String
 		isGrantable := row.IsGrantable.Valid && row.IsGrantable.Bool
 

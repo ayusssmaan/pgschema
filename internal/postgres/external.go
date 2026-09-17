@@ -142,8 +142,41 @@ func (ed *ExternalDatabase) ApplySchema(ctx context.Context, schema string, sql 
 	}
 
 	// Set search_path to the temporary schema, with public as fallback
-	// for resolving extension types installed in public schema (issue #197)
-	setSearchPathSQL := fmt.Sprintf("SET search_path TO \"%s\", public", ed.tempSchema)
+	// for resolving extension types installed in public schema (issue #197).
+	//
+	// Also append every other schema that hosts an installed extension (e.g.
+	// pgvector's "vector" living in a non-public schema like "domain").
+	// Desired-state SQL for an extension-owned column is written unqualified,
+	// same as any other same-schema reference (e.g. "embedding vector(384)"),
+	// and stripSchemaQualifications only strips - it never adds - a schema
+	// prefix. Without the extension's real schema in this search_path, such a
+	// bare reference cannot resolve inside the temp schema at all, since the
+	// temp schema has no copy of the type and "public" may not either (issue
+	// #518's apply-time failure mode, not addressed by #544's pre-flight
+	// schema-consistency check alone). This is safe: NewExternalDatabase
+	// already validated that every extension shared between the plan and
+	// target databases lives in the same schema on both, so resolving a bare
+	// extension reference against the plan database's copy here is exactly
+	// equivalent to how it resolves on the real target.
+	extraSchemas, err := getExtensionSchemas(ed.db)
+	if err != nil {
+		return fmt.Errorf("failed to query extension schemas: %w", err)
+	}
+	searchPathParts := []string{quoteIdent(ed.tempSchema), "public"}
+	seen := map[string]bool{ed.tempSchema: true, "public": true}
+	extraSchemaNames := make([]string, 0, len(extraSchemas))
+	for _, extSchema := range extraSchemas {
+		extraSchemaNames = append(extraSchemaNames, extSchema)
+	}
+	sort.Strings(extraSchemaNames)
+	for _, extSchema := range extraSchemaNames {
+		if seen[extSchema] {
+			continue
+		}
+		seen[extSchema] = true
+		searchPathParts = append(searchPathParts, quoteIdent(extSchema))
+	}
+	setSearchPathSQL := fmt.Sprintf("SET search_path TO %s", strings.Join(searchPathParts, ", "))
 	if _, err := util.ExecContextWithLogging(ctx, conn, setSearchPathSQL, "set search_path for desired state"); err != nil {
 		return fmt.Errorf("failed to set search_path: %w", err)
 	}
