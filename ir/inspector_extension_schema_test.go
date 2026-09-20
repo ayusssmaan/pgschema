@@ -3,45 +3,56 @@ package ir
 import "testing"
 
 // stripSameSchemaPrefix must strip a prefix matching either the routine's own
-// schema, or (only when routineSchema is pgschema's own temp comparison
-// schema, pgschema_tmp_*, AND the specific type is a catalog-verified
-// extension member) a schema known to host an installed extension (issue
-// #518): when introspecting that temp schema, a function's routineSchema *is*
-// the temp schema name, so an extension-owned type's real schema qualifier
-// (e.g. "domain.vector") never matches routineSchema and would otherwise
-// survive unstripped - causing the temp-schema side and the real-target side
-// of a diff to compare as different function signatures.
+// schema, or (only for the schema this Inspector's managedSchema is set to,
+// and only for a catalog-verified extension member of it) an
+// extension-owned type (issue #518): when introspecting pgschema's own
+// temporary comparison schema, every function's routineSchema is that temp
+// schema's literal name regardless of which real schema it represents, so an
+// extension-owned type's real schema qualifier (e.g. "domain.vector") never
+// matches routineSchema and would otherwise survive unstripped - causing the
+// temp-schema side and the real-target side of a diff to compare as
+// different function signatures.
 //
-// Critically, this must NOT fire for a routine's genuine, permanent schema:
-// a function actually declared in "app" taking a "domain.vector" parameter
-// is a real cross-schema reference and must stay qualified, or generated
-// CREATE/DROP/GRANT DDL would reference an unresolvable bare "vector" (a
-// regression caught in PR #608 review - see the temp-schema-prefix guard).
+// Scoping the fallback to managedSchema specifically (never "any known
+// extension schema") matters because a function that is itself part of the
+// schema being managed can still take a parameter whose type genuinely lives
+// in a different schema (e.g. a function declared in a managed "app" schema
+// taking a "domain.vector" parameter, where pgvector lives in "domain", not
+// "app"). Since every function's routineSchema during temp-schema
+// introspection is the same temp-schema literal regardless of which real
+// schema it represents, a check keyed off "is routineSchema a temp schema"
+// alone can't distinguish that genuine cross-schema reference from a
+// same-managed-schema one - only checking against managedSchema itself can
+// (a regression caught in PR #608 review, HIGH severity: the original
+// temp-schema-prefix-only gate stripped this case incorrectly).
 //
-// It also must NOT fire for a type that merely lives in a schema an
-// extension happens to occupy but isn't itself an extension member (a schema
-// can host both) - another regression caught in PR #608 review, addressed by
-// checking extensionOwnedTypes rather than extensionSchemas alone.
+// It also must NOT fire for a type that merely lives in managedSchema
+// without being an extension member (a schema can host both extension-owned
+// and ordinary user-defined objects) - another regression caught in PR #608
+// review, addressed by checking extensionOwnedTypes rather than
+// extensionSchemas alone.
 func TestStripSameSchemaPrefix_ExtensionSchemaAware(t *testing.T) {
 	tests := []struct {
 		name                string
 		typeName            string
 		routineSchema       string
+		managedSchema       string
 		extensionSchemas    map[string]bool
 		extensionOwnedTypes map[string]bool
 		want                string
 	}{
 		{
-			name:             "strips routine's own schema, no extension schemas known",
-			typeName:         "domain.mytype",
-			routineSchema:    "domain",
-			extensionSchemas: nil,
-			want:             "mytype",
+			name:          "strips routine's own schema, no extension schemas known",
+			typeName:      "domain.mytype",
+			routineSchema: "domain",
+			managedSchema: "domain",
+			want:          "mytype",
 		},
 		{
-			name:                "routine schema is the temp schema, and type is a confirmed extension member",
+			name:                "temp-schema introspection, type is a confirmed member of managedSchema",
 			typeName:            "domain.vector",
 			routineSchema:       "pgschema_tmp_20260101_000000_abcd1234",
+			managedSchema:       "domain",
 			extensionSchemas:    map[string]bool{"domain": true},
 			extensionOwnedTypes: map[string]bool{"domain.vector": true},
 			want:                "vector",
@@ -50,6 +61,7 @@ func TestStripSameSchemaPrefix_ExtensionSchemaAware(t *testing.T) {
 			name:                "quoted extension schema qualifier",
 			typeName:            `"domain".vector`,
 			routineSchema:       "pgschema_tmp_xxx",
+			managedSchema:       "domain",
 			extensionSchemas:    map[string]bool{"domain": true},
 			extensionOwnedTypes: map[string]bool{"domain.vector": true},
 			want:                "vector",
@@ -58,6 +70,7 @@ func TestStripSameSchemaPrefix_ExtensionSchemaAware(t *testing.T) {
 			name:                "array of a confirmed extension member type",
 			typeName:            "domain.vector[]",
 			routineSchema:       "pgschema_tmp_xxx",
+			managedSchema:       "domain",
 			extensionSchemas:    map[string]bool{"domain": true},
 			extensionOwnedTypes: map[string]bool{"domain.vector": true},
 			want:                "vector[]",
@@ -66,6 +79,7 @@ func TestStripSameSchemaPrefix_ExtensionSchemaAware(t *testing.T) {
 			name:                "quoted mixed-case extension member type - membership check must unquote",
 			typeName:            `domain."Vector"`,
 			routineSchema:       "pgschema_tmp_xxx",
+			managedSchema:       "domain",
 			extensionSchemas:    map[string]bool{"domain": true},
 			extensionOwnedTypes: map[string]bool{"domain.Vector": true},
 			want:                `"Vector"`,
@@ -74,30 +88,56 @@ func TestStripSameSchemaPrefix_ExtensionSchemaAware(t *testing.T) {
 			name:                "quoted mixed-case array of a confirmed extension member type",
 			typeName:            `domain."Vector"[]`,
 			routineSchema:       "pgschema_tmp_xxx",
+			managedSchema:       "domain",
 			extensionSchemas:    map[string]bool{"domain": true},
 			extensionOwnedTypes: map[string]bool{"domain.Vector": true},
 			want:                `"Vector"[]`,
 		},
 		{
-			name:                "genuine cross-schema reference in a real (non-temp) schema is preserved",
+			// A function declared in the managed "app" schema takes a parameter
+			// whose type genuinely lives in "domain" (a different schema, which
+			// hosts pgvector) - real-target-side introspection: routineSchema
+			// equals managedSchema ("app"), which does not itself host any
+			// extension, so the fallback never even considers "domain".
+			name:                "genuine cross-schema reference within the managed schema's own function - real side",
 			typeName:            "domain.vector",
 			routineSchema:       "app",
+			managedSchema:       "app",
 			extensionSchemas:    map[string]bool{"domain": true},
 			extensionOwnedTypes: map[string]bool{"domain.vector": true},
 			want:                "domain.vector",
 		},
 		{
-			name:                "schema hosts an extension, but this specific type is not a member",
+			// Same scenario, but introspected via the temp schema - HIGH
+			// severity regression from PR #608 review: a gate based only on
+			// "is routineSchema a temp schema" would strip this incorrectly,
+			// since every function's routineSchema is the same temp-schema
+			// literal here regardless of which real schema it belongs to.
+			// Checking against managedSchema ("app", which hosts no
+			// extension) rather than looping every known extension schema is
+			// what keeps this qualified, matching the real side above.
+			name:                "genuine cross-schema reference within the managed schema's own function - temp side",
+			typeName:            "domain.vector",
+			routineSchema:       "pgschema_tmp_xxx",
+			managedSchema:       "app",
+			extensionSchemas:    map[string]bool{"domain": true},
+			extensionOwnedTypes: map[string]bool{"domain.vector": true},
+			want:                "domain.vector",
+		},
+		{
+			name:                "managed schema hosts an extension, but this specific type is not a member",
 			typeName:            "exts.status",
 			routineSchema:       "pgschema_tmp_xxx",
+			managedSchema:       "exts",
 			extensionSchemas:    map[string]bool{"exts": true},
 			extensionOwnedTypes: map[string]bool{"exts.vector": true},
 			want:                "exts.status",
 		},
 		{
-			name:                "cross-schema type unaffected - schema matches neither routine nor any extension",
+			name:                "cross-schema type unaffected - schema matches neither routine nor managed schema",
 			typeName:            "utils.hstore",
 			routineSchema:       "pgschema_tmp_xxx",
+			managedSchema:       "domain",
 			extensionSchemas:    map[string]bool{"domain": true},
 			extensionOwnedTypes: map[string]bool{"domain.vector": true},
 			want:                "utils.hstore",
@@ -106,6 +146,7 @@ func TestStripSameSchemaPrefix_ExtensionSchemaAware(t *testing.T) {
 			name:                "already-bare type unaffected",
 			typeName:            "vector",
 			routineSchema:       "pgschema_tmp_xxx",
+			managedSchema:       "domain",
 			extensionSchemas:    map[string]bool{"domain": true},
 			extensionOwnedTypes: map[string]bool{"domain.vector": true},
 			want:                "vector",
@@ -114,6 +155,7 @@ func TestStripSameSchemaPrefix_ExtensionSchemaAware(t *testing.T) {
 			name:                "empty type name",
 			typeName:            "",
 			routineSchema:       "domain",
+			managedSchema:       "domain",
 			extensionSchemas:    map[string]bool{"domain": true},
 			extensionOwnedTypes: map[string]bool{"domain.vector": true},
 			want:                "",
@@ -122,7 +164,7 @@ func TestStripSameSchemaPrefix_ExtensionSchemaAware(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			insp := &Inspector{extensionSchemas: tt.extensionSchemas, extensionOwnedTypes: tt.extensionOwnedTypes}
+			insp := &Inspector{managedSchema: tt.managedSchema, extensionSchemas: tt.extensionSchemas, extensionOwnedTypes: tt.extensionOwnedTypes}
 			if got := insp.stripSameSchemaPrefix(tt.typeName, tt.routineSchema); got != tt.want {
 				t.Errorf("stripSameSchemaPrefix(%q, %q) = %q, want %q", tt.typeName, tt.routineSchema, got, tt.want)
 			}
@@ -132,13 +174,14 @@ func TestStripSameSchemaPrefix_ExtensionSchemaAware(t *testing.T) {
 
 // stripSameSchemaPrefixFromReturnType must decompose SETOF and TABLE(...)
 // return types the same way ir/normalize.go's stripSchemaFromReturnType
-// does, applying the extension-membership-aware stripSameSchemaPrefix to
-// each contained type rather than a single top-level prefix check. Without
-// this, "RETURNS vector" would compare as "domain.vector" (temp side) vs
-// "vector" (real target side) and spuriously trigger a drop+recreate (PR
-// #608 review feedback).
+// does, applying the managedSchema-scoped stripSameSchemaPrefix to each
+// contained type rather than a single top-level prefix check. Without this,
+// "RETURNS vector" would compare as "domain.vector" (temp side) vs "vector"
+// (real target side) and spuriously trigger a drop+recreate (PR #608 review
+// feedback).
 func TestStripSameSchemaPrefixFromReturnType(t *testing.T) {
 	insp := &Inspector{
+		managedSchema:       "domain",
 		extensionSchemas:    map[string]bool{"domain": true},
 		extensionOwnedTypes: map[string]bool{"domain.vector": true},
 	}
@@ -168,10 +211,10 @@ func TestStripSameSchemaPrefixFromReturnType(t *testing.T) {
 			want:          "TABLE(id integer, embedding vector)",
 		},
 		{
-			name:          "direct extension-owned return type on a real, permanent schema is preserved",
+			name:          "direct extension-owned return type on the managed schema's own real routine",
 			returnType:    "domain.vector",
-			routineSchema: "app",
-			want:          "domain.vector",
+			routineSchema: "domain",
+			want:          "vector",
 		},
 	}
 
@@ -182,13 +225,28 @@ func TestStripSameSchemaPrefixFromReturnType(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("genuine cross-schema return type on a differently-managed schema is preserved", func(t *testing.T) {
+		appInsp := &Inspector{
+			managedSchema:       "app",
+			extensionSchemas:    map[string]bool{"domain": true},
+			extensionOwnedTypes: map[string]bool{"domain.vector": true},
+		}
+		for _, routineSchema := range []string{"app", "pgschema_tmp_xxx"} {
+			if got := appInsp.stripSameSchemaPrefixFromReturnType("domain.vector", routineSchema); got != "domain.vector" {
+				t.Errorf("stripSameSchemaPrefixFromReturnType(%q, %q) = %q, want %q", "domain.vector", routineSchema, got, "domain.vector")
+			}
+		}
+	})
 }
 
 // stripExtensionMemberTypeQualifiers is buildPrivileges' equivalent of
 // stripSameSchemaPrefix's extension-membership check, operating on a whole
-// function/procedure identity-arguments string instead of a single type.
+// function/procedure identity-arguments string instead of a single type, and
+// scoped to managedSchema the same way.
 func TestStripExtensionMemberTypeQualifiers(t *testing.T) {
 	insp := &Inspector{
+		managedSchema:       "domain",
 		extensionSchemas:    map[string]bool{"domain": true},
 		extensionOwnedTypes: map[string]bool{"domain.vector": true, "domain.Vector": true},
 	}
@@ -227,4 +285,16 @@ func TestStripExtensionMemberTypeQualifiers(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("genuine cross-schema privilege signature on a differently-managed schema is preserved", func(t *testing.T) {
+		appInsp := &Inspector{
+			managedSchema:       "app",
+			extensionSchemas:    map[string]bool{"domain": true},
+			extensionOwnedTypes: map[string]bool{"domain.vector": true},
+		}
+		in := "vector_search(query_embedding domain.vector)"
+		if got := appInsp.stripExtensionMemberTypeQualifiers(in); got != in {
+			t.Errorf("stripExtensionMemberTypeQualifiers(%q) = %q, want unchanged %q", in, got, in)
+		}
+	})
 }

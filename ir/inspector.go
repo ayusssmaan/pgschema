@@ -39,21 +39,37 @@ type Inspector struct {
 	db           *sql.DB
 	queries      *queries.Queries
 	ignoreConfig *IgnoreConfig
+	// managedSchema is the logical schema pgschema is planning/applying,
+	// which can differ from targetSchema (the schema this particular
+	// BuildIR call actually introspects): when introspecting pgschema's own
+	// temporary comparison schema, targetSchema is that temp schema's
+	// literal name, but managedSchema is the real schema it stands in for
+	// (e.g. "domain"). Set via SetManagedSchema before calling BuildIR;
+	// defaults to targetSchema if never set, which is correct for every
+	// caller that introspects the schema it means to manage directly (dump,
+	// apply's current-state read, etc.) - only the desired-state/temp-schema
+	// path needs to set it explicitly.
+	managedSchema string
 	// extensionSchemas is the set of schema names hosting at least one
 	// installed extension on this connection, populated once per BuildIR call
-	// (see populateExtensionSchemas). Used only as a candidate list of
-	// schemas worth checking against extensionOwnedTypes below; membership in
-	// this set alone is never sufficient to strip a qualifier, since a schema
-	// can host both extension-owned and ordinary user-defined objects.
+	// (see populateExtensionSchemas). Only ever consulted for managedSchema
+	// itself, never any other schema - see stripSameSchemaPrefix.
 	extensionSchemas map[string]bool
 	// extensionOwnedTypes is the set of "schema.typename" pairs that are
 	// confirmed, catalog-verified members of an installed extension (via
 	// pg_depend, deptype='e'; see populateExtensionSchemas). Consulted by
-	// stripSameSchemaPrefix and buildPrivileges, but only when the schema
-	// currently being introspected is pgschema's own temporary comparison
-	// schema (pgschema_tmp_*) - never for a routine's real, permanent
-	// schema, where an extension-owned type from a different schema is a
-	// genuine cross-schema reference that must stay qualified (issue #518).
+	// stripSameSchemaPrefix and buildPrivileges, but only for a type
+	// qualified with managedSchema specifically - never an arbitrary schema
+	// that happens to host some extension elsewhere in the database, and
+	// never for a routine's real, permanent schema when it differs from
+	// managedSchema, where an extension-owned type from a different schema
+	// is a genuine cross-schema reference that must stay qualified (issue
+	// #518, PR #608 review feedback: this must be scoped to managedSchema,
+	// not "any known extension schema" or "any temp-schema introspection",
+	// or a genuinely cross-schema reference to another schema's extension
+	// type - e.g. a function in a managed "app" schema taking a
+	// "domain.vector" parameter - would also get incorrectly stripped while
+	// introspecting the temp schema).
 	extensionOwnedTypes map[string]bool
 }
 
@@ -66,8 +82,19 @@ func NewInspector(db *sql.DB, ignoreConfig *IgnoreConfig) *Inspector {
 	}
 }
 
+// SetManagedSchema records the logical schema this Inspector's BuildIR call
+// represents, when it differs from the schema literally being introspected
+// (see the managedSchema field comment). Must be called before BuildIR.
+func (i *Inspector) SetManagedSchema(schema string) {
+	i.managedSchema = schema
+}
+
 // BuildIR builds the schema IR from the database for a specific schema
 func (i *Inspector) BuildIR(ctx context.Context, targetSchema string) (*IR, error) {
+	if i.managedSchema == "" {
+		i.managedSchema = targetSchema
+	}
+
 	schema := NewIR()
 
 	// Sequential prerequisites
@@ -1304,25 +1331,26 @@ func (i *Inspector) stripSameSchemaPrefix(typeName, routineSchema string) string
 		}
 	}
 
-	// Also strip a prefix matching a schema known to host an installed
-	// extension, but ONLY when routineSchema is pgschema's own temporary
-	// comparison schema (pgschema_tmp_*, see GenerateTempSchemaName) AND the
-	// specific type is a catalog-verified extension member (see
-	// populateExtensionSchemas) - never for a routine's genuine, permanent
-	// home schema, and never for an ordinary type that merely happens to
-	// live in a schema an extension also occupies.
+	// Also strip a prefix matching managedSchema specifically - never any
+	// other schema, even one that hosts an installed extension - and only
+	// when the specific type is a catalog-verified extension member (see
+	// populateExtensionSchemas).
 	//
-	// The temp-schema gate matters because both the embedded and external
-	// plan-DB providers apply desired-state SQL into exactly one such temp
-	// schema per plan/apply (see cmd/plan/plan.go), so a function's
-	// routineSchema during that introspection is always the temp schema name
-	// rather than its real target schema, which would otherwise leave a
-	// genuinely same-extension type qualified there while the live database
-	// renders it bare (issue #518). Without this gate, a genuinely
-	// cross-schema type reference on a real routine (e.g. a function in
-	// "app" taking a "domain.vector" parameter) would also get stripped,
-	// even though it must stay qualified since neither generated DDL nor the
-	// real target's search_path would otherwise be able to resolve it.
+	// Scoping to managedSchema (rather than "any known extension schema", or
+	// gating on routineSchema looking like a temp schema) matters because
+	// when introspecting pgschema's own temporary comparison schema, every
+	// object's routineSchema is that temp schema's literal name regardless
+	// of which real schema it represents - so a routine genuinely declared
+	// in some other, unmanaged schema (e.g. "app") that merely takes a
+	// parameter of managedSchema's extension type (e.g. "domain.vector")
+	// would also have routineSchema equal to the temp schema string during
+	// that introspection. Checking only against managedSchema itself (never
+	// looping every known extension schema, and never keying off
+	// routineSchema's shape) is what correctly leaves that genuine
+	// cross-schema reference qualified on both the temp and real-target
+	// sides, while still stripping a type that's genuinely in managedSchema
+	// wherever it's introspected from (issue #518, PR #608 review
+	// feedback).
 	//
 	// The extension-membership check matters because a schema can host both
 	// extension-owned and ordinary user-defined objects (e.g. an "exts"
@@ -1330,12 +1358,8 @@ func (i *Inspector) stripSameSchemaPrefix(typeName, routineSchema string) string
 	// "exts.status" type) - only the former is safe to treat as
 	// automatically resolvable without qualification (PR #608 review
 	// feedback).
-	if strings.HasPrefix(routineSchema, "pgschema_tmp_") {
-		for extSchema := range i.extensionSchemas {
-			stripped, ok := stripSchemaPrefixIfMatches(typeName, extSchema)
-			if !ok {
-				continue
-			}
+	if i.managedSchema != "" && i.extensionSchemas[i.managedSchema] {
+		if stripped, ok := stripSchemaPrefixIfMatches(typeName, i.managedSchema); ok {
 			// extensionOwnedTypes is keyed by the raw, unquoted pg_type.typname
 			// (see populateExtensionSchemas), so a quoted mixed-case type (e.g.
 			// stripped == "\"Vector\"") must be unquoted before the membership
@@ -1344,7 +1368,7 @@ func (i *Inspector) stripSameSchemaPrefix(typeName, routineSchema string) string
 			// feedback). stripped itself (still quoted, if it was quoted) is what
 			// gets returned, so a valid identifier is preserved either way.
 			baseType := unquoteIdentifier(strings.TrimSuffix(stripped, "[]"))
-			if i.extensionOwnedTypes[extSchema+"."+baseType] {
+			if i.extensionOwnedTypes[i.managedSchema+"."+baseType] {
 				return stripped
 			}
 		}
@@ -1495,40 +1519,38 @@ func (i *Inspector) stripSameSchemaPrefixFromList(list, schema string) string {
 	return StripSchemaQualifiers(list, schema)
 }
 
-// stripExtensionMemberTypeQualifiers drops a "<schema>." qualifier from s
-// only where the schema is a known extension schema AND the identifier
-// immediately following it is a catalog-verified extension member (see
-// populateExtensionSchemas / extensionOwnedTypes) - not merely because the
-// schema hosts some extension. A schema can hold both extension-owned and
-// ordinary user-defined objects (e.g. an "exts" schema with both pgvector's
-// "vector" and an unrelated user-defined "exts.status" type); only the
-// former is safe to treat as automatically resolvable without qualification
-// (PR #608 review feedback). Callers gate this on the schema currently being
-// introspected being pgschema's own temp comparison schema, same as
-// stripSameSchemaPrefix.
+// stripExtensionMemberTypeQualifiers drops a "<managedSchema>." qualifier
+// from s only where the identifier immediately following it is a
+// catalog-verified extension member of managedSchema specifically (see
+// populateExtensionSchemas / extensionOwnedTypes) - never any other schema,
+// even one that hosts some other installed extension, and never an ordinary
+// object that merely lives in managedSchema without being an extension
+// member. Scoping to managedSchema alone (rather than looping every known
+// extension schema) is what keeps a genuinely cross-schema reference to
+// another schema's extension type qualified, on both the temp-schema and
+// real-target sides (PR #608 review feedback - see stripSameSchemaPrefix's
+// comment for the full rationale, which applies identically here).
 func (i *Inspector) stripExtensionMemberTypeQualifiers(s string) string {
-	if s == "" || len(i.extensionOwnedTypes) == 0 {
+	if s == "" || i.managedSchema == "" || !i.extensionSchemas[i.managedSchema] || len(i.extensionOwnedTypes) == 0 {
 		return s
 	}
-	for extSchema := range i.extensionSchemas {
-		// The identifier group matches either a quoted identifier (allowing
-		// "" escapes) or a bare one, so a quoted mixed-case member type (e.g.
-		// domain."Vector") is captured too - not just plain lowercase names
-		// (PR #608 review feedback).
-		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(extSchema) + `\.("(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_$]*)`)
-		s = re.ReplaceAllStringFunc(s, func(match string) string {
-			ident := match[len(extSchema)+1:]
-			// extensionOwnedTypes is keyed by the raw, unquoted pg_type.typname,
-			// so the membership check must unquote ident first; the returned
-			// value keeps ident as originally captured (quoted or not) so a
-			// valid identifier is preserved either way.
-			if i.extensionOwnedTypes[extSchema+"."+unquoteIdentifier(ident)] {
-				return ident
-			}
-			return match
-		})
-	}
-	return s
+	extSchema := i.managedSchema
+	// The identifier group matches either a quoted identifier (allowing ""
+	// escapes) or a bare one, so a quoted mixed-case member type (e.g.
+	// domain."Vector") is captured too - not just plain lowercase names
+	// (PR #608 review feedback).
+	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(extSchema) + `\.("(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_$]*)`)
+	return re.ReplaceAllStringFunc(s, func(match string) string {
+		ident := match[len(extSchema)+1:]
+		// extensionOwnedTypes is keyed by the raw, unquoted pg_type.typname,
+		// so the membership check must unquote ident first; the returned
+		// value keeps ident as originally captured (quoted or not) so a
+		// valid identifier is preserved either way.
+		if i.extensionOwnedTypes[extSchema+"."+unquoteIdentifier(ident)] {
+			return ident
+		}
+		return match
+	})
 }
 
 // oidToTypeName maps PostgreSQL type OIDs to standard SQL type names.
@@ -2438,16 +2460,14 @@ func (i *Inspector) buildPrivileges(ctx context.Context, schema *IR, targetSchem
 		// FUNCTION/PROCEDURE object_name is rendered by pg_get_function_identity_arguments
 		// directly in SQL (see GetPrivilegesForSchema), so it never goes through
 		// stripSameSchemaPrefix the way parseParametersFromSignature does. Strip it
-		// here too (routine's own schema always; any extension-member type only when
-		// targetSchema is pgschema's own temp comparison schema, matching
-		// stripSameSchemaPrefix's gating and its extension-membership check - see
-		// its comment for why both are required, or a genuinely cross-schema or
-		// non-member privilege signature would lose its qualifier).
+		// here too: routine's own schema always, plus managedSchema's extension-member
+		// types specifically (stripExtensionMemberTypeQualifiers is itself scoped to
+		// managedSchema - see its comment and stripSameSchemaPrefix's for why a
+		// genuinely cross-schema or non-member privilege signature must keep its
+		// qualifier).
 		if objectType == "FUNCTION" || objectType == "PROCEDURE" {
 			objectName = StripSchemaQualifiers(objectName, targetSchema)
-			if strings.HasPrefix(targetSchema, "pgschema_tmp_") {
-				objectName = i.stripExtensionMemberTypeQualifiers(objectName)
-			}
+			objectName = i.stripExtensionMemberTypeQualifiers(objectName)
 		}
 		owner := row.Owner.String
 		isGrantable := row.IsGrantable.Valid && row.IsGrantable.Bool

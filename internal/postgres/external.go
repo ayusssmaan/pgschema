@@ -24,6 +24,14 @@ type ExternalDatabase struct {
 	tempSchema         string   // Temporary schema name with timestamp suffix
 	targetMajorVersion int      // Expected major version (from target database)
 	stubRoles          []string // Roles created for ALTER DEFAULT PRIVILEGES (issue #553)
+	// targetExtensions is ExternalDatabaseConfig.TargetExtensions, kept for
+	// ApplySchema: getExtensionSchemas(ed.db) only sees what's installed on
+	// the plan database, so without cross-checking against what's actually
+	// on the target, an extension installed only on the plan side (e.g. for
+	// local testing convenience) would let a bare type reference resolve
+	// during planning that the real target could never resolve at apply
+	// time - plan succeeds, apply fails (PR #608 review feedback).
+	targetExtensions map[string]string
 }
 
 // ExternalDatabaseConfig holds configuration for connecting to an external database
@@ -106,6 +114,7 @@ func NewExternalDatabase(config *ExternalDatabaseConfig) (*ExternalDatabase, err
 		password:           config.Password,
 		tempSchema:         tempSchema,
 		targetMajorVersion: config.TargetMajorVersion,
+		targetExtensions:   config.TargetExtensions,
 	}, nil
 }
 
@@ -180,7 +189,16 @@ func (ed *ExternalDatabase) ApplySchema(ctx context.Context, schema string, sql 
 	if err != nil {
 		return fmt.Errorf("failed to query extension schemas: %w", err)
 	}
-	setSearchPathSQL := fmt.Sprintf("SET search_path TO %s", buildDesiredStateSearchPath(ed.tempSchema, schema, extraSchemas))
+	// getExtensionSchemas only sees the plan database. validateExtensionSchemas
+	// (in NewExternalDatabase) explicitly permits an extension present on only
+	// one side, so an extension installed on the plan database alone (e.g. for
+	// local testing convenience) is not itself an error - but it would be
+	// wrong to add its schema to search_path here: a bare type reference would
+	// then resolve during planning that the real target, lacking the
+	// extension entirely, could never resolve at apply time. Only trust an
+	// extension confirmed present on both sides (PR #608 review feedback).
+	confirmedSchemas := filterConfirmedExtensionSchemas(extraSchemas, ed.targetExtensions)
+	setSearchPathSQL := fmt.Sprintf("SET search_path TO %s", buildDesiredStateSearchPath(ed.tempSchema, schema, confirmedSchemas))
 	if _, err := util.ExecContextWithLogging(ctx, conn, setSearchPathSQL, "set search_path for desired state"); err != nil {
 		return fmt.Errorf("failed to set search_path: %w", err)
 	}
@@ -372,6 +390,24 @@ func buildDesiredStateSearchPath(tempSchema, schema string, extensionSchemas map
 	}
 	parts = append(parts, "public")
 	return strings.Join(parts, ", ")
+}
+
+// filterConfirmedExtensionSchemas keeps only the entries of planSchemas
+// (extname -> schema, from getExtensionSchemas on the plan database) whose
+// extension name also appears in targetExtensions (extname -> schema, from
+// the real target). getExtensionSchemas only sees the plan database, and
+// validateExtensionSchemas explicitly permits an extension present on only
+// one side - so without this filter, a plan-only extension would let a bare
+// type reference resolve during planning that the real target could never
+// resolve at apply time (PR #608 review feedback).
+func filterConfirmedExtensionSchemas(planSchemas, targetExtensions map[string]string) map[string]string {
+	confirmed := make(map[string]string, len(planSchemas))
+	for extName, extSchema := range planSchemas {
+		if _, onTarget := targetExtensions[extName]; onTarget {
+			confirmed[extName] = extSchema
+		}
+	}
+	return confirmed
 }
 
 // detectMajorVersion queries the database to determine its PostgreSQL major version
