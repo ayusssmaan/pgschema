@@ -63,6 +63,22 @@ func TestStripSameSchemaPrefix_ExtensionSchemaAware(t *testing.T) {
 			want:                "vector[]",
 		},
 		{
+			name:                "quoted mixed-case extension member type - membership check must unquote",
+			typeName:            `domain."Vector"`,
+			routineSchema:       "pgschema_tmp_xxx",
+			extensionSchemas:    map[string]bool{"domain": true},
+			extensionOwnedTypes: map[string]bool{"domain.Vector": true},
+			want:                `"Vector"`,
+		},
+		{
+			name:                "quoted mixed-case array of a confirmed extension member type",
+			typeName:            `domain."Vector"[]`,
+			routineSchema:       "pgschema_tmp_xxx",
+			extensionSchemas:    map[string]bool{"domain": true},
+			extensionOwnedTypes: map[string]bool{"domain.Vector": true},
+			want:                `"Vector"[]`,
+		},
+		{
 			name:                "genuine cross-schema reference in a real (non-temp) schema is preserved",
 			typeName:            "domain.vector",
 			routineSchema:       "app",
@@ -174,7 +190,7 @@ func TestStripSameSchemaPrefixFromReturnType(t *testing.T) {
 func TestStripExtensionMemberTypeQualifiers(t *testing.T) {
 	insp := &Inspector{
 		extensionSchemas:    map[string]bool{"domain": true},
-		extensionOwnedTypes: map[string]bool{"domain.vector": true},
+		extensionOwnedTypes: map[string]bool{"domain.vector": true, "domain.Vector": true},
 	}
 
 	tests := []struct {
@@ -196,6 +212,11 @@ func TestStripExtensionMemberTypeQualifiers(t *testing.T) {
 			name: "leaves an unrelated schema untouched",
 			in:   "g(x utils.hstore)",
 			want: "g(x utils.hstore)",
+		},
+		{
+			name: "strips a quoted mixed-case confirmed extension member type",
+			in:   `h(x domain."Vector")`,
+			want: `h(x "Vector")`,
 		},
 	}
 

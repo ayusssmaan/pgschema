@@ -1418,7 +1418,14 @@ func (i *Inspector) stripSameSchemaPrefix(typeName, routineSchema string) string
 			if !ok {
 				continue
 			}
-			baseType := strings.TrimSuffix(stripped, "[]")
+			// extensionOwnedTypes is keyed by the raw, unquoted pg_type.typname
+			// (see populateExtensionSchemas), so a quoted mixed-case type (e.g.
+			// stripped == "\"Vector\"") must be unquoted before the membership
+			// lookup - comparing the quoted form would never match and silently
+			// leave every quoted extension-member type qualified (PR #608 review
+			// feedback). stripped itself (still quoted, if it was quoted) is what
+			// gets returned, so a valid identifier is preserved either way.
+			baseType := unquoteIdentifier(strings.TrimSuffix(stripped, "[]"))
 			if i.extensionOwnedTypes[extSchema+"."+baseType] {
 				return stripped
 			}
@@ -1586,10 +1593,18 @@ func (i *Inspector) stripExtensionMemberTypeQualifiers(s string) string {
 		return s
 	}
 	for extSchema := range i.extensionSchemas {
-		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(extSchema) + `\.([A-Za-z_][A-Za-z0-9_$]*)`)
+		// The identifier group matches either a quoted identifier (allowing
+		// "" escapes) or a bare one, so a quoted mixed-case member type (e.g.
+		// domain."Vector") is captured too - not just plain lowercase names
+		// (PR #608 review feedback).
+		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(extSchema) + `\.("(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_$]*)`)
 		s = re.ReplaceAllStringFunc(s, func(match string) string {
 			ident := match[len(extSchema)+1:]
-			if i.extensionOwnedTypes[extSchema+"."+ident] {
+			// extensionOwnedTypes is keyed by the raw, unquoted pg_type.typname,
+			// so the membership check must unquote ident first; the returned
+			// value keeps ident as originally captured (quoted or not) so a
+			// valid identifier is preserved either way.
+			if i.extensionOwnedTypes[extSchema+"."+unquoteIdentifier(ident)] {
 				return ident
 			}
 			return match

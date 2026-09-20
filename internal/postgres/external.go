@@ -168,20 +168,19 @@ func (ed *ExternalDatabase) ApplySchema(ctx context.Context, schema string, sql 
 	// pg_catalog out of its default implicit-first search position for the
 	// common case of a bundled extension (e.g. plpgsql) living there (PR
 	// #608 review feedback).
+	//
+	// Inserted before "public" (not after): the real apply session's
+	// search_path is "<schema>, public", so the managed schema takes
+	// priority over public there. Appending it after public here would flip
+	// that priority for the plan-side lookup, letting a same-named object in
+	// public shadow the managed schema's extension type on the plan side
+	// while the real target resolves it the other way around (PR #608
+	// review feedback).
 	extraSchemas, err := getExtensionSchemas(ed.db)
 	if err != nil {
 		return fmt.Errorf("failed to query extension schemas: %w", err)
 	}
-	searchPathParts := []string{quoteIdent(ed.tempSchema), "public"}
-	if schema != "public" {
-		for _, extSchema := range extraSchemas {
-			if extSchema == schema {
-				searchPathParts = append(searchPathParts, quoteIdent(schema))
-				break
-			}
-		}
-	}
-	setSearchPathSQL := fmt.Sprintf("SET search_path TO %s", strings.Join(searchPathParts, ", "))
+	setSearchPathSQL := fmt.Sprintf("SET search_path TO %s", buildDesiredStateSearchPath(ed.tempSchema, schema, extraSchemas))
 	if _, err := util.ExecContextWithLogging(ctx, conn, setSearchPathSQL, "set search_path for desired state"); err != nil {
 		return fmt.Errorf("failed to set search_path: %w", err)
 	}
@@ -344,6 +343,29 @@ func getExtensionSchemas(db *sql.DB) (map[string]string, error) {
 
 func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// buildDesiredStateSearchPath builds the search_path used when applying
+// desired-state SQL to the temporary comparison schema: the temp schema
+// first, then the managed schema itself if it hosts an installed extension,
+// then public - in that order, to mirror the real apply session's
+// "<schema>, public" priority (see cmd/apply/apply.go). extensionSchemas is
+// the extname -> schema map from getExtensionSchemas. Not every extension
+// schema in the database is included, only the managed one, or a same-named
+// object in public could shadow the extension type on the plan side while
+// resolving the other way on the real target (PR #608 review feedback).
+func buildDesiredStateSearchPath(tempSchema, schema string, extensionSchemas map[string]string) string {
+	parts := []string{quoteIdent(tempSchema)}
+	if schema != "public" {
+		for _, extSchema := range extensionSchemas {
+			if extSchema == schema {
+				parts = append(parts, quoteIdent(schema))
+				break
+			}
+		}
+	}
+	parts = append(parts, "public")
+	return strings.Join(parts, ", ")
 }
 
 // detectMajorVersion queries the database to determine its PostgreSQL major version
