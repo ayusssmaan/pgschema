@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1510,13 +1509,19 @@ func (i *Inspector) populateExtensionSchemas(ctx context.Context) error {
 }
 
 // stripSameSchemaPrefixFromList is stripSameSchemaPrefix for a comma-separated
-// argument list such as pg_get_function_identity_arguments output. It strips a
+// argument list such as pg_get_function_identity_arguments output (used for
+// aggregate identity args/signatures - see buildAggregates). It strips a
 // schema qualifier only where an identifier token equal to the schema (bare or
 // quote_ident form) directly precedes a dot, so a schema that needs quoting
 // ("MySchema".v) normalizes like public.v while quoted names that merely
-// contain the schema text ("public.foo") are left intact.
+// contain the schema text ("public.foo") are left intact. Also applies
+// managedSchema's extension-membership-aware stripping (same as
+// stripExtensionMemberTypeQualifiers uses for privileges) - without this, an
+// aggregate over an extension-owned type (e.g. "domain.vector") would key as
+// "vector" on the real side but stay "domain.vector" on the temp side and be
+// spuriously dropped/recreated (PR #608 review feedback).
 func (i *Inspector) stripSameSchemaPrefixFromList(list, schema string) string {
-	return StripSchemaQualifiers(list, schema)
+	return i.stripExtensionMemberTypeQualifiers(StripSchemaQualifiers(list, schema))
 }
 
 // stripExtensionMemberTypeQualifiers drops a "<managedSchema>." qualifier
@@ -1535,22 +1540,67 @@ func (i *Inspector) stripExtensionMemberTypeQualifiers(s string) string {
 		return s
 	}
 	extSchema := i.managedSchema
-	// The identifier group matches either a quoted identifier (allowing ""
-	// escapes) or a bare one, so a quoted mixed-case member type (e.g.
-	// domain."Vector") is captured too - not just plain lowercase names
-	// (PR #608 review feedback).
-	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(extSchema) + `\.("(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_$]*)`)
-	return re.ReplaceAllStringFunc(s, func(match string) string {
-		ident := match[len(extSchema)+1:]
-		// extensionOwnedTypes is keyed by the raw, unquoted pg_type.typname,
-		// so the membership check must unquote ident first; the returned
-		// value keeps ident as originally captured (quoted or not) so a
-		// valid identifier is preserved either way.
-		if i.extensionOwnedTypes[extSchema+"."+unquoteIdentifier(ident)] {
-			return ident
+
+	// A regex over raw text can't tell a genuine "<schema>.<type>" qualifier
+	// from the same bytes appearing inside an unrelated quoted identifier
+	// (e.g. a parameter literally named "domain.vector"), and can't match a
+	// quoted schema ("Domain".vector) at all. Use the same single-pass,
+	// quoted-identifier-aware tokenizer as StripSchemaQualifiers instead,
+	// with one token of lookahead to check extension membership before
+	// deciding whether to strip (PR #608 review feedback).
+	var out strings.Builder
+	out.Grow(len(s))
+	pos := 0
+	for pos < len(s) {
+		token, end := scanIdentToken(s, pos)
+		if isIdentToken(token) && end < len(s) && s[end] == '.' && unquoteIdentifier(token) == extSchema {
+			nextTok, nextEnd := scanIdentToken(s, end+1)
+			if isIdentToken(nextTok) && i.extensionOwnedTypes[extSchema+"."+unquoteIdentifier(nextTok)] {
+				out.WriteString(nextTok)
+				pos = nextEnd
+				continue
+			}
 		}
-		return match
-	})
+		out.WriteString(token)
+		pos = end
+	}
+	return out.String()
+}
+
+// scanIdentToken extracts one token from s starting at pos, using the same
+// rules as StripSchemaQualifiers: a quoted identifier (honoring "" escapes),
+// a run of identifier characters, or a single other byte. Returns the token
+// and the position right after it.
+func scanIdentToken(s string, pos int) (token string, end int) {
+	start := pos
+	switch {
+	case s[pos] == '"':
+		pos++
+		for pos < len(s) {
+			if s[pos] == '"' {
+				if pos+1 < len(s) && s[pos+1] == '"' {
+					pos += 2
+					continue
+				}
+				pos++
+				break
+			}
+			pos++
+		}
+	case isIdentChar(s[pos]):
+		for pos < len(s) && isIdentChar(s[pos]) {
+			pos++
+		}
+	default:
+		pos++
+	}
+	return s[start:pos], pos
+}
+
+// isIdentToken reports whether token (as returned by scanIdentToken) is an
+// identifier - quoted or bare - rather than a single punctuation byte.
+func isIdentToken(token string) bool {
+	return token != "" && (token[0] == '"' || isIdentChar(token[0]))
 }
 
 // oidToTypeName maps PostgreSQL type OIDs to standard SQL type names.

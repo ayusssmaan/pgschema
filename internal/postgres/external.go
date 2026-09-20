@@ -197,6 +197,30 @@ func (ed *ExternalDatabase) ApplySchema(ctx context.Context, schema string, sql 
 	// then resolve during planning that the real target, lacking the
 	// extension entirely, could never resolve at apply time. Only trust an
 	// extension confirmed present on both sides (PR #608 review feedback).
+	//
+	// Known limitation, deliberately not "fixed" further (PR #608 review
+	// feedback): adding the managed schema to search_path exposes every bare
+	// reference to that schema's whole namespace, not just the confirmed
+	// extension member - if the plan database's copy of that schema also had
+	// some other object the target lacks, a bare reference could resolve on
+	// the plan side and then fail to apply on the real target. There is no
+	// narrower alternative that's actually safer:
+	//   - Postgres's search_path has no per-object granularity - it's
+	//     schema-wide or nothing.
+	//   - Rewriting the desired-state SQL text to explicitly qualify bare
+	//     extension-type references instead of expanding search_path would
+	//     reintroduce exactly the ambiguity issue #354's design already
+	//     rejected: text can't reliably distinguish a type reference from an
+	//     identically-named column/parameter, so a rewrite risks silently
+	//     qualifying the wrong token rather than just failing loudly.
+	//   - Rejecting any dependency from the temp schema on a non-extension
+	//     object in the managed schema isn't viable either: this whole
+	//     scenario (ddms's domain schema) legitimately co-locates the
+	//     extension with ordinary user tables/functions in the same schema,
+	//     which is exactly the case #518 needs to keep working.
+	// The practical mitigation is operational, not code: keep the plan
+	// database's copy of an extension-hosting schema free of objects that
+	// don't also exist on the real target.
 	confirmedSchemas := filterConfirmedExtensionSchemas(extraSchemas, ed.targetExtensions)
 	setSearchPathSQL := fmt.Sprintf("SET search_path TO %s", buildDesiredStateSearchPath(ed.tempSchema, schema, confirmedSchemas))
 	if _, err := util.ExecContextWithLogging(ctx, conn, setSearchPathSQL, "set search_path for desired state"); err != nil {

@@ -276,6 +276,25 @@ func TestStripExtensionMemberTypeQualifiers(t *testing.T) {
 			in:   `h(x domain."Vector")`,
 			want: `h(x "Vector")`,
 		},
+		{
+			// A parameter literally NAMED the quoted identifier "domain.vector"
+			// (a valid, if unusual, Postgres identifier - dots are permitted
+			// inside quotes). A raw-text regex can't tell this apart from a
+			// genuine schema.type qualifier since it doesn't track quoting
+			// context; the tokenizer treats the whole quoted string as one
+			// atomic token and never looks inside it (PR #608 review feedback).
+			name: "quoted identifier that merely contains dotted text is left untouched",
+			in:   `f("domain.vector" integer)`,
+			want: `f("domain.vector" integer)`,
+		},
+		{
+			// A quoted schema qualifier - the old regex only ever matched the
+			// bare, unquoted schema name literally, so this never stripped at
+			// all (PR #608 review feedback).
+			name: "quoted schema qualifier on a confirmed member type",
+			in:   `k(x "domain".vector)`,
+			want: `k(x vector)`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -297,4 +316,23 @@ func TestStripExtensionMemberTypeQualifiers(t *testing.T) {
 			t.Errorf("stripExtensionMemberTypeQualifiers(%q) = %q, want unchanged %q", in, got, in)
 		}
 	})
+}
+
+// stripSameSchemaPrefixFromList (used for aggregate identity args and
+// signatures) must also apply managedSchema's extension-membership-aware
+// stripping, not just the basic same-schema strip - otherwise an aggregate
+// over an extension-owned type keys as "vector" on the real side but stays
+// "domain.vector" on the temp side and is spuriously dropped/recreated (PR
+// #608 review feedback).
+func TestStripSameSchemaPrefixFromList(t *testing.T) {
+	insp := &Inspector{
+		managedSchema:       "domain",
+		extensionSchemas:    map[string]bool{"domain": true},
+		extensionOwnedTypes: map[string]bool{"domain.vector": true},
+	}
+	in := "domain.vector"
+	want := "vector"
+	if got := insp.stripSameSchemaPrefixFromList(in, "pgschema_tmp_xxx"); got != want {
+		t.Errorf("stripSameSchemaPrefixFromList(%q, %q) = %q, want %q", in, "pgschema_tmp_xxx", got, want)
+	}
 }
