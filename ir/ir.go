@@ -60,13 +60,13 @@ type Table struct {
 	Dependencies      []TableDependency      `json:"dependencies"`
 	Comment           string                 `json:"comment,omitempty"`
 	IsPartitioned     bool                   `json:"is_partitioned"`
-	PartitionStrategy string                 `json:"partition_strategy,omitempty"`  // RANGE, LIST, HASH
-	PartitionKey      string                 `json:"partition_key,omitempty"`       // Column(s) used for partitioning
-	PartitionOf       string                 `json:"partition_of,omitempty"`        // Parent table name (partition children)
+	PartitionStrategy string                 `json:"partition_strategy,omitempty"` // RANGE, LIST, HASH
+	PartitionKey      string                 `json:"partition_key,omitempty"`      // Column(s) used for partitioning
+	PartitionOf       string                 `json:"partition_of,omitempty"`       // Parent table name (partition children)
 	PartitionOfSchema string                 `json:"partition_of_schema,omitempty"` // Parent table schema (partition children)
-	PartitionBound    string                 `json:"partition_bound,omitempty"`     // Partition bound expression (e.g. "FOR VALUES IN (1, 2)" or "DEFAULT")
-	LikeClauses       []LikeClause           `json:"like_clauses,omitempty"`        // LIKE clauses in CREATE TABLE
-	Unlogged          bool                   `json:"unlogged,omitempty"`            // True for UNLOGGED tables
+	PartitionBound    string                 `json:"partition_bound,omitempty"`    // Partition bound expression (e.g. "FOR VALUES IN (1, 2)" or "DEFAULT")
+	LikeClauses       []LikeClause           `json:"like_clauses,omitempty"`       // LIKE clauses in CREATE TABLE
+	Unlogged          bool                   `json:"unlogged,omitempty"`           // True for UNLOGGED tables
 	// AllConstraintNames records every constraint name present on the table in
 	// the database, including constraints not represented in the IR (NOT NULL
 	// constraints on PG18+, redundant CHECK (col IS NOT NULL) constraints,
@@ -80,12 +80,6 @@ type Table struct {
 	// child DEFAULT/NOT NULL overrides without managing or fingerprinting the
 	// parent itself.
 	PartitionParentColumns []*Column `json:"-"`
-	// DataManaged is true when the table matches [data] in pgschema.toml and
-	// its rows are part of the desired state. Rows holds those rows, in
-	// DataColumns() order. Both are excluded from serialization, and therefore
-	// from fingerprints and plan JSON.
-	DataManaged bool   `json:"-"`
-	Rows        []*Row `json:"-"`
 }
 
 // Column represents a table column
@@ -103,6 +97,10 @@ type Column struct {
 	GeneratedExpr *string   `json:"generated_expr,omitempty"` // Expression for generated columns
 	IsGenerated   bool      `json:"is_generated,omitempty"`   // True if this is a generated column
 	GeneratedKind string    `json:"generated_kind,omitempty"` // "s" for STORED, "v" for VIRTUAL (PG18+)
+	// Collation is the column's explicit collation, already quoted and
+	// schema-qualified unless it lives in pg_catalog (e.g. "C", public.my_coll).
+	// Empty when the column uses its data type's default collation (issue #593).
+	Collation string `json:"collation,omitempty"`
 	// InvalidNotNullConstraint is the name of a NOT NULL constraint on this
 	// column that was added NOT VALID and has not been validated yet (PG18+).
 	// The column already reads as NOT NULL (attnotnull is set), so without this
@@ -306,9 +304,9 @@ type Index struct {
 type IndexColumn struct {
 	Name      string `json:"name"`
 	Position  int    `json:"position"`
-	Direction string `json:"direction,omitempty"`  // ASC, DESC
-	NullOrder string `json:"null_order,omitempty"` // NULLS FIRST, NULLS LAST (only when non-default)
-	Operator  string `json:"operator,omitempty"`   // operator class
+	Direction string `json:"direction,omitempty"`   // ASC, DESC
+	NullOrder string `json:"null_order,omitempty"`  // NULLS FIRST, NULLS LAST (only when non-default)
+	Operator  string `json:"operator,omitempty"`    // operator class
 }
 
 // IndexType represents different types of database indexes

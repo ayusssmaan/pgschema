@@ -39,8 +39,6 @@ type Inspector struct {
 	db           *sql.DB
 	queries      *queries.Queries
 	ignoreConfig *IgnoreConfig
-	dataConfig   *DataConfig
-	loadRows     bool
 	// extensionSchemas is the set of schema names hosting at least one
 	// installed extension on this connection, populated once per BuildIR call
 	// (see populateExtensionSchemas). Used only as a candidate list of
@@ -66,16 +64,6 @@ func NewInspector(db *sql.DB, ignoreConfig *IgnoreConfig) *Inspector {
 		queries:      queries.New(db),
 		ignoreConfig: ignoreConfig,
 	}
-}
-
-// WithDataConfig sets the [data] configuration. Tables matching it are marked
-// DataManaged by BuildIR and, when loadRows is true, get their rows loaded
-// into Table.Rows. Dump passes false: it only needs to know which tables to
-// export and reads the rows itself with COPY.
-func (i *Inspector) WithDataConfig(dataConfig *DataConfig, loadRows bool) *Inspector {
-	i.dataConfig = dataConfig
-	i.loadRows = loadRows
-	return i
 }
 
 // BuildIR builds the schema IR from the database for a specific schema
@@ -163,12 +151,6 @@ func (i *Inspector) BuildIR(ctx context.Context, targetSchema string) (*IR, erro
 
 	if err := i.buildPartitionParentColumns(ctx, schema, targetSchema); err != nil {
 		return nil, fmt.Errorf("failed to build partition parent columns: %w", err)
-	}
-
-	// Load rows of data-managed tables now that columns, constraints, and
-	// partitions are known.
-	if err := i.buildRows(ctx, schema, targetSchema); err != nil {
-		return nil, fmt.Errorf("failed to build rows: %w", err)
 	}
 
 	// Build function dependencies after functions are loaded
@@ -282,9 +264,6 @@ func (i *Inspector) buildTables(ctx context.Context, schema *IR, targetSchema st
 
 		// Check if table should be ignored
 		if i.ignoreConfig != nil && i.ignoreConfig.ShouldIgnoreTable(tableName) {
-			if i.dataConfig.IsDataTable(tableName) {
-				return fmt.Errorf("table %q is listed under [data] in pgschema.toml and matched by [tables] in .pgschemaignore; a table cannot be both managed and ignored", tableName)
-			}
 			continue
 		}
 
@@ -359,6 +338,9 @@ func (i *Inspector) buildColumns(ctx context.Context, schema *IR, targetSchema s
 		}
 		if col.InvalidNotNullConstraint.Valid {
 			column.InvalidNotNullConstraint = col.InvalidNotNullConstraint.String
+		}
+		if col.ColumnCollation.Valid {
+			column.Collation = col.ColumnCollation.String
 		}
 
 		// Handle generated columns first (attgenerated: 's' = STORED, 'v' = VIRTUAL in PG18+)
@@ -691,8 +673,8 @@ func (i *Inspector) buildConstraints(ctx context.Context, schema *IR, targetSche
 		}
 	}
 
-	// Build a mapping of partition tables to their parent's partition keys
-	partitionMapping := i.buildPartitionMapping(ctx, schema, targetSchema)
+	// Record which tables are partitions of which parents
+	i.populatePartitionChildMetadata(ctx, schema, targetSchema)
 
 	// Add constraints to tables
 	for key, constraint := range constraintGroups {
@@ -715,19 +697,6 @@ func (i *Inspector) buildConstraints(ctx context.Context, schema *IR, targetSche
 			}
 
 			table.Constraints[key.name] = constraint
-
-			// For partitioned tables, ensure primary key columns are ordered with partition key first
-			// This special handling overrides the position-based sorting for partitioned tables
-			if constraint.Type == ConstraintTypePrimaryKey && table.IsPartitioned && table.PartitionKey != "" {
-				i.sortPrimaryKeyColumnsForPartitionedTable(constraint, table.PartitionKey)
-			}
-
-			// For partition tables (children of partitioned tables), use parent's partition key
-			if constraint.Type == ConstraintTypePrimaryKey && !table.IsPartitioned {
-				if parentPartitionKey, isPartitionTable := partitionMapping[key.table]; isPartitionTable {
-					i.sortPrimaryKeyColumnsForPartitionedTable(constraint, parentPartitionKey)
-				}
-			}
 		}
 	}
 
@@ -744,16 +713,14 @@ func requiresPositionSorting(constraintType ConstraintType) bool {
 	}
 }
 
-// buildPartitionMapping builds a mapping from partition table names to their parent's partition keys
-// and populates partition child metadata (PartitionOf, PartitionOfSchema, PartitionBound) on child tables.
-func (i *Inspector) buildPartitionMapping(ctx context.Context, schema *IR, targetSchema string) map[string]string {
-	partitionMapping := make(map[string]string)
-
+// populatePartitionChildMetadata populates partition child metadata
+// (PartitionOf, PartitionOfSchema, PartitionBound) on child tables.
+func (i *Inspector) populatePartitionChildMetadata(ctx context.Context, schema *IR, targetSchema string) {
 	// Get partition children information
 	partitionChildren, err := i.queries.GetPartitionChildren(ctx)
 	if err != nil {
-		// If we can't get partition info, return empty mapping
-		return partitionMapping
+		// If we can't get partition info, leave the metadata unset
+		return
 	}
 
 	dbSchema := schema.getOrCreateSchema(targetSchema)
@@ -764,25 +731,15 @@ func (i *Inspector) buildPartitionMapping(ctx context.Context, schema *IR, targe
 			continue
 		}
 
-		childTable := child.ChildTable
-		parentTable := child.ParentTable
-
 		// Set partition child metadata on the child table
-		if childTableInfo, exists := dbSchema.Tables[childTable]; exists {
-			childTableInfo.PartitionOf = parentTable
+		if childTableInfo, exists := dbSchema.Tables[child.ChildTable]; exists {
+			childTableInfo.PartitionOf = child.ParentTable
 			childTableInfo.PartitionOfSchema = child.ParentSchema
 			if child.PartitionBound.Valid {
 				childTableInfo.PartitionBound = child.PartitionBound.String
 			}
 		}
-
-		// Find the parent table's partition key
-		if parentTableInfo, exists := dbSchema.Tables[parentTable]; exists && parentTableInfo.IsPartitioned {
-			partitionMapping[childTable] = parentTableInfo.PartitionKey
-		}
 	}
-
-	return partitionMapping
 }
 
 // buildPartitionParentColumns keeps unmanaged parents available for comparing
@@ -819,45 +776,6 @@ func (i *Inspector) buildPartitionParentColumns(ctx context.Context, schema *IR,
 		}
 	}
 	return nil
-}
-
-// sortPrimaryKeyColumnsForPartitionedTable sorts primary key constraint columns
-// to ensure partition key columns come first
-func (i *Inspector) sortPrimaryKeyColumnsForPartitionedTable(constraint *Constraint, partitionKey string) {
-	if constraint.Type != ConstraintTypePrimaryKey || len(constraint.Columns) <= 1 {
-		return
-	}
-
-	// Parse partition key to handle multi-column partitions
-	partitionColumns := make(map[string]bool)
-	for _, col := range strings.Split(partitionKey, ",") {
-		partitionColumns[strings.TrimSpace(col)] = true
-	}
-
-	// Separate partition columns from non-partition columns
-	var partitionCols []*ConstraintColumn
-	var nonPartitionCols []*ConstraintColumn
-
-	for _, col := range constraint.Columns {
-		if partitionColumns[col.Name] {
-			partitionCols = append(partitionCols, col)
-		} else {
-			nonPartitionCols = append(nonPartitionCols, col)
-		}
-	}
-
-	// Sort partition columns by their position to maintain consistent ordering
-	sort.Slice(partitionCols, func(i, j int) bool {
-		return partitionCols[i].Position < partitionCols[j].Position
-	})
-
-	// Sort non-partition columns by their position
-	sort.Slice(nonPartitionCols, func(i, j int) bool {
-		return nonPartitionCols[i].Position < nonPartitionCols[j].Position
-	})
-
-	// Rebuild the columns list with partition columns first
-	constraint.Columns = append(partitionCols, nonPartitionCols...)
 }
 
 func (i *Inspector) buildIndexes(ctx context.Context, schema *IR, targetSchema string) error {

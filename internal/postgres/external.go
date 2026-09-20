@@ -208,6 +208,11 @@ func (ed *ExternalDatabase) ApplySchema(ctx context.Context, schema string, sql 
 	// so we need to rewrite it to point to the temporary schema (issue #335)
 	schemaAgnosticSQL = replaceSchemaInSearchPath(schemaAgnosticSQL, schema, ed.tempSchema)
 
+	// Point target-schema qualifiers inside function bodies at the temporary schema so that
+	// SQL functions inlined by later statements resolve (issue #596). Only objects created by
+	// this SQL are rewritten: the plan database's own target schema may hold extensions.
+	schemaAgnosticSQL = qualifyFunctionBodiesWithTempSchema(schemaAgnosticSQL, schema, ed.tempSchema, extractCreatedObjectNames(schemaAgnosticSQL))
+
 	// Stub every role the desired state references so GRANT/POLICY/DEFAULT
 	// PRIVILEGES statements apply in the plan database (issue #450). A
 	// successful CREATE ROLE is the sole proof that a role is ours to drop on
@@ -248,8 +253,9 @@ func (ed *ExternalDatabase) ApplySchema(ctx context.Context, schema string, sql 
 	// Execute the SQL directly
 	// Note: Desired state SQL should never contain operations like CREATE INDEX CONCURRENTLY
 	// that cannot run in transactions. Those are migration details, not state declarations.
-	if err := ExecuteSchemaSQL(ctx, conn, schemaAgnosticSQL, schema); err != nil {
-		enhanced := hintExtensionDependency(err, "this schema may depend on a PostgreSQL extension that is not installed in the plan database. Install the extension in the plan database (CREATE EXTENSION) and re-run, see https://www.pgschema.com/cli/plan-db")
+	if _, err := util.ExecContextWithLogging(ctx, conn, schemaAgnosticSQL, "apply desired state SQL to temporary schema"); err != nil {
+		enhanced := enhanceApplyError(err, schemaAgnosticSQL)
+		enhanced = hintExtensionDependency(enhanced, "this schema may depend on a PostgreSQL extension that is not installed in the plan database. Install the extension in the plan database (CREATE EXTENSION) and re-run, see https://www.pgschema.com/cli/plan-db")
 		enhanced = hintCrossSchemaReference(enhanced, "this schema may reference objects in another schema that are not present in the plan database. If the table exists on the target database, add it to .pgschemaignore ([schemas] or schema-qualified [tables] pattern), see https://www.pgschema.com/cli/ignore. Otherwise create those objects in the plan database or add a stub CREATE SCHEMA/TABLE in your desired SQL, see https://www.pgschema.com/cli/plan-db")
 		return fmt.Errorf("failed to apply schema SQL to temporary schema %s: %w", ed.tempSchema, enhanced)
 	}
